@@ -16,112 +16,175 @@
 #include <iterator>
 #include <string>
 
-using std::cerr;
-using std::cout;
-using std::endl;
-using std::exception;
-namespace po = boost::program_options;
+#include "params_parsing.hpp"
+#include "game.hpp"
+#include "serialization.hpp"
+#include "deserialization.hpp"
 
-class ProgramParams {
-   private:
-    std::string player_name;
-    uint16_t port;
-    sockaddr *server_address;
-    sockaddr *gui_address;
-
-   public:
-    ProgramParams(std::string x, uint16_t p, sockaddr *ser_ad, sockaddr *gui_ad)
-        : player_name(x),
-          port(p),
-          server_address(ser_ad),
-          gui_address(gui_ad){};
-
-    void set_port(uint16_t port_param) { port = port_param; }
-
-    void set_player_name(std::string name_param) { player_name = name_param; }
-
-    void set_server_address(sockaddr *server_addr_param) {
-        server_address = server_addr_param;
+static boost::asio::awaitable<void>
+gui_listener(boost::asio::ip::udp::socket *socket_listen,
+             boost::asio::ip::tcp::socket *server_socket, GameInfo &game_info) {
+    size_t read;
+    for (;;) {
+        co_await Deserialization::receive_udp_datagram(socket_listen, read);
+        if (!game_info.join_sent && Deserialization::gui_datagram_is_legit(read)) {
+            co_await Serialization::send_message_to_server(server_socket, SEND_JOIN_CODE,
+                                                           game_info.my_player_name);
+            game_info.join_sent = true;
+        } else if (Deserialization::gui_datagram_is_legit(read) && !game_info.in_lobby) {
+            co_await Deserialization::react_to_gui_message(server_socket);
+        }
     }
-
-    void set_gui_address(sockaddr *gui_addr_param) {
-        gui_address = gui_addr_param;
-    }
-
-    std::string get_player_name() { return player_name; }
-
-    uint16_t get_port() { return port; }
-
-    sockaddr *get_server_address() { return server_address; }
-
-    sockaddr *get_gui_address() { return gui_address; }
-};
-
-std::tuple<std::string, std::string> parse_server_address(
-    std::string address_spec, std::string default_service = "https") {
-    using namespace boost::spirit::x3;
-    auto service = ':' >> +~char_(":") >> eoi;
-    auto host = '[' >> *~char_(']') >> ']'  // e.g. for IPV6
-                | raw[*("::" | (char_ - service))];
-
-    std::tuple<std::string, std::string> result;
-    parse(begin(address_spec), end(address_spec),
-          expect[host >> (service | attr(default_service))], result);
-
-    return result;
+    co_return;
 }
 
-ProgramParams parse_program_params(int argc, char **av) {
-    po::options_description desc("Allowed options");
-    desc.add_options()("help,h", "produce help message")(
-        "port,p", po::value<uint16_t>(), "port")(
-        "player-name,n", po::value<std::string>(), "player-name")(
-        "gui-address,d", po::value<std::string>(), "gui-address")(
-        "server-address,s", po::value<std::string>(), "server-address");
-
-    po::variables_map vm;
-    po::store(po::parse_command_line(argc, av, desc), vm);
-    po::notify(vm);
-
-    if (vm.count("help")) {
-        cout << desc << "\n";
-        exit(0);
+static boost::asio::awaitable<void>
+listen_to_hello_message(GameInfo &game_info, boost::asio::ip::tcp::socket *socket,
+                        bool &received_hello) {
+    if (!received_hello) {
+        received_hello = true;
+        Message::HelloMessage message = co_await
+        Deserialization::receive_hello_message(socket);
+        game_info.update_with_hello_info(message);
     }
+}
 
-    if (!vm.count("port") || !vm.count("player-name") ||
-        !vm.count("server-address") || !vm.count("gui-address")) {
-        cerr << "Wrong arguments provided\n";
-        cerr << desc << "\n";
+static boost::asio::awaitable<void>
+listen_to_accepted_player_message(GameInfo &game_info, boost::asio::ip::tcp::socket *socket) {
+    if (game_info.in_lobby) {
+        Message::AcceptedPlayerMessage message = co_await
+        Deserialization::receive_accepted_player_message(
+                socket);
+        game_info.update_with_accepted_player_info(message);
+    }
+}
+
+static boost::asio::awaitable<void>
+listen_to_game_started_message(GameInfo &game_info, boost::asio::ip::tcp::socket *socket,
+                               bool &just_received_game_started) {
+    if (game_info.in_lobby) {
+        just_received_game_started = true;
+        Message::GameStartedMessage message = co_await
+        Deserialization::receive_game_started_message(
+                socket);
+        game_info.update_with_game_started_info(message);
+    }
+}
+
+static boost::asio::awaitable<void>
+listen_to_turn_message(GameInfo &game_info, boost::asio::ip::tcp::socket *socket) {
+    game_info.explosions.clear();
+    Message::TurnMessage message = co_await
+    Deserialization::receive_turn_message(socket);
+    game_info.update_with_turn_info(message);
+}
+
+static boost::asio::awaitable<void>
+listen_to_game_ended_message(GameInfo &game_info, boost::asio::ip::tcp::socket *socket) {
+    co_await Deserialization::receive_game_ended_message(socket);
+    game_info.update_with_game_ended_info();
+}
+
+static boost::asio::awaitable<void>
+inform_gui(GameInfo &game_info, boost::asio::ip::udp::socket *send_udp_socket,
+           boost::asio::ip::udp::endpoint &endpoint,
+           bool &just_received_game_started) {
+    if (just_received_game_started)
+        just_received_game_started = false;
+    else if (game_info.in_lobby)
+        co_await Serialization::send_lobby_message(send_udp_socket, endpoint, game_info);
+    else
+        co_await Serialization::send_game_message(send_udp_socket, endpoint, game_info);
+}
+
+static boost::asio::awaitable<void>
+server_listener(boost::asio::ip::tcp::socket *socket, boost::asio::ip::udp::socket *send_udp_socket,
+                boost::asio::ip::udp::endpoint &endpoint, GameInfo &game_info) {
+    bool received_hello = false;
+    bool just_received_game_started = false;
+    for (;;) {
+        try {
+            buffer_index = 0;
+            co_await Deserialization::receive_n_bytes(1, socket);
+            switch (shared_buffer[0]) {
+                case HELLO_CODE: {
+                    co_await listen_to_hello_message(game_info, socket, received_hello);
+                    break;
+                }
+                case ACCEPTED_PLAYER_CODE: {
+                    co_await listen_to_accepted_player_message(game_info, socket);
+                    break;
+                }
+                case GAME_STARTED_CODE: {
+                    co_await listen_to_game_started_message(game_info, socket,
+                                                            just_received_game_started);
+                    break;
+                }
+                case TURN_CODE: {
+                    co_await listen_to_turn_message(game_info, socket);
+                    break;
+                }
+                case GAME_ENDED_CODE: {
+                    co_await listen_to_game_ended_message(game_info, socket);
+                    break;
+                }
+                default: {
+                    throw std::runtime_error("Invalid message from server.");
+                    break;
+                }
+            }
+        } catch (std::exception &e) {
+            std::cerr << "error: " << e.what() << "\n";
+            exit(1);
+        }
+        co_await inform_gui(game_info, send_udp_socket, endpoint, just_received_game_started);
+    }
+    co_return;
+}
+
+static void robots_client(ProgramParams::ProgramParams &program_params) {
+    GameInfo game_info;
+    game_info.my_player_name = program_params.player_name; // Set player name.
+    boost::asio::io_context io_context;
+    // Set up TCP socket.
+    boost::asio::ip::tcp::resolver server_resolver(io_context);
+    boost::asio::ip::tcp::resolver::results_type server_endpoint = server_resolver.resolve(
+            program_params.server_address.host, program_params.server_address.port);
+    boost::asio::ip::tcp::no_delay option(true); // Disable Nagle's algorithm.
+    boost::asio::ip::tcp::socket server_socket(io_context);
+    boost::asio::connect(server_socket, server_endpoint);
+    server_socket.set_option(option);
+    // Set up UDP socket for sending datagrams.
+    boost::asio::ip::udp::resolver gui_resolver(io_context);
+    boost::asio::ip::udp::endpoint gui_endpoint = *gui_resolver.resolve(
+            program_params.gui_address.host,
+            program_params.gui_address.port).begin();
+    boost::asio::ip::udp::socket gui_socket(io_context);
+    gui_socket.open(boost::asio::ip::udp::v6());
+    // Set up UDP socket for receiving datagrams.
+    boost::asio::ip::udp::socket gui_socket_listen(io_context);
+    gui_socket_listen.open(boost::asio::ip::udp::v6());
+    gui_socket_listen.bind({boost::asio::ip::udp::v6(), program_params.port});
+
+    boost::asio::signal_set signals(io_context, SIGINT, SIGTERM);
+    signals.async_wait([&](auto, auto) { io_context.stop(); });
+
+    boost::asio::co_spawn(io_context, gui_listener(&gui_socket_listen, &server_socket, game_info),
+                          boost::asio::detached);
+    boost::asio::co_spawn(io_context, server_listener(&server_socket, &gui_socket, gui_endpoint,
+                                                      game_info), boost::asio::detached);
+
+    io_context.run();
+}
+
+int main(int argc, char **argv) {
+    try {
+        ProgramParams::ProgramParams program_params = ProgramParams::parse_program_params(argc,
+                                                                                          argv);
+        robots_client(program_params);
+    } catch (std::exception &e) {
+        std::cerr << "error: " << e.what() << "\n";
         exit(1);
     }
-
-    std::tuple<std::string, std::string> server_params =
-        parse_server_address(vm["server-address"].as<std::string>());
-    addrinfo *server_address;
-    getaddrinfo(std::get<0>(server_params).c_str(), std::get<1>(server_params).c_str(), NULL,
-                &server_address);
-
-    std::tuple<std::string, std::string> gui_params =
-        parse_server_address(vm["gui-address"].as<std::string>());
-    addrinfo *gui_address;
-    getaddrinfo(std::get<0>(gui_params).c_str(), std::get<1>(gui_params).c_str(), NULL,
-                &gui_address);
-
-    ProgramParams program_params(vm["player-name"].as<std::string>(),
-                                 vm["port"].as<uint16_t>(),
-                                 server_address->ai_addr, gui_address->ai_addr);
-    return program_params;
-}
-
-int main(int argc, char **argv) { 
-    ProgramParams program_params = parse_program_params(argc, argv);
-
-    // test zeby zobaczyc czy mnie z czyms polaczy
-    int socket_fd = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
-    connect(socket_fd, program_params.get_server_address(), sizeof(program_params.get_server_address()));
-    const char* message = "chuj";
-    size_t message_length = strlen(message);
-    ssize_t sent_length = send(socket_fd, message, message_length, 0);
-    cout << "sent " << sent_length << " bytes\n";
-    return 0; 
+    return 0;
 }
